@@ -1,0 +1,98 @@
+---
+title: "code_robust"
+output: pdf_document
+date: "2024-12-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(haven)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(estimatr)
+library(stargazer)
+library(ggplot2)
+library(data.table)
+library(xtable)
+```
+
+## R Markdown
+
+```{r}
+main_df <- read_dta("clean_parliament_data.dta")
+data_voter <- main_df[c("District", "year", "turnout_vage", "high_conflict_pop")]
+high_district <- unique(data_voter$District[data_voter$high_conflict_pop==1])
+data_voter$all_high <- as.numeric(data_voter$District  %in% high_district)
+test_agg_high <- aggregate(turnout_vage~year+all_high, data=data_voter, 
+                           mean, na.action = NULL, na.rm=FALSE)
+orig_did <- read.csv("did_data.csv")
+treat_year <- orig_did$treat_year
+test_agg_high$intensity <- "high"
+test_agg_high$intensity[test_agg_high$all_high == 0] <- "low"
+
+line_plot <- ggplot(data=test_agg_high, aes(x=as.factor(year), y=turnout_vage, group=intensity)) +
+  geom_line(aes(color=intensity)) + geom_point() + 
+  labs(y="Voter Turnout Rate", x="Year") + 
+  guides(color = guide_legend(title = "Conflict Intensity"))
+
+ggsave("parallel_trend_pop.pdf",line_plot, width=7, height=4)
+```
+
+```{r}
+subset_2008 <- subset(main_df, year==2008)
+subset_2008$conflict_intensity <- "High"
+subset_2008$conflict_intensity[subset_2008$high_conflict_pop == 0] <- "Low"
+plot <- ggplot(data=subset_2008, aes(x=as.factor(District), y=vic_cn, fill=factor(conflict_intensity))) + geom_bar(stat="identity") +
+   theme_bw() + labs(y="Victim Count", x="District")+
+  theme(axis.text.x = element_text(angle = 90, size = 7.5))+
+  guides(fill=guide_legend(title="Conflict Intensity"))
+ggsave("conflict_barplot_distict_pop.pdf", plot, width=11, height=6)
+```
+## Create the data 
+
+You can also embed plots, for example:
+
+```{r}
+data_voter$treat_year <- treat_year
+data_voter$post <- as.numeric(data_voter$year > treat_year)
+data_voter$interaction <- data_voter$post * data_voter$high_conflict_pop
+data_voter$turnout_rate <- data_voter$turnout_vage / 100
+```
+
+### Basic TWFE 
+```{r}
+model1 <- lm(turnout_rate ~ interaction + factor(year) + factor(District), data=data_voter) 
+summary(model1)
+```
+### TWFE with covariates 
+```{r}
+literacy_data <- read.csv("literacy_pooled_data.csv", check.names = FALSE)
+#literacy_panel <- panel_data(literacy_data, id=District, wave=)
+did_data_covar <- merge(data_voter, literacy_data, by=c("year", "District"))
+did_data_covar$literacy_rate <- did_data_covar$literacy_rate / 100
+model2 <- lm(turnout_rate ~ interaction + literacy_rate + factor(year) + factor(District), 
+             data=did_data_covar) 
+summary(model2)
+```
+
+
+## Staggered DiD
+```{r}
+data_voter$district_id <- as.numeric(factor(data_voter$District))
+data_voter$treat_year <- ifelse(data_voter$treat_year==2010, 2025, data_voter$treat_year)
+results <- att_gt(yname = "turnout_rate", tname="year", idname="district_id", 
+                  gname="treat_year", data=data_voter)
+agg_result <- aggte(results, type = "dynamic", min_e = -15, max_e = 15)
+
+fig <- ggdid(agg_result)
+fig <- fig +
+  labs( 
+    x = "time (years)",                     # Label for the x-axis
+    y = "ATT-estimate"                      # Label for the y-axis
+  )
+ggsave(filename = "ggdid_plot_pop.pdf", plot = fig, 
+       width = 6, height = 4, dpi = 300)
+print("Aggregate")
+aggte(results, type = "simple")
+```

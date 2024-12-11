@@ -1,0 +1,215 @@
+---
+title: "project"
+output: html_document
+date: "2024-12-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(haven)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(estimatr)
+library(stargazer)
+library(broom)
+library(ggplot2)
+library(data.table)
+library(xtable)
+library(did)
+```
+
+
+### Visualizing the casualties 
+```{r}
+casualty_df <- read.csv("casualty_cleaned.csv")
+```
+
+### Plot of Incident Types 
+```{r}
+plot <- ggplot(casualty_df, aes(x=as.factor(year), fill=incident_description)) +     
+  geom_bar() + 
+  theme(axis.text.x = element_text(angle = 90, size = 10)) + 
+  labs(y="Victim Count", x="Year") +
+  guides(fill=guide_legend(title="Incident Type"))
+ggsave("incident_barplot.pdf", plot, width=11, height=6)
+```
+
+### Detecting structural breaks 
+```{r}
+data <- read.csv("incident_tally.csv")
+years <- data$year
+data <- data[ , -1]
+
+perform_significant_qlr <- function(incidents, years, max_breaks = 2, significance_level = 0.05) {
+  breaks <- list()  # To store breakpoints
+  remaining_data <- incidents
+  remaining_years <- years
+  
+  for (i in seq_len(max_breaks)) {
+    n <- length(remaining_data)
+    if (n < 3) {
+      break  
+    }
+    model <- Fstats(remaining_data ~ 1)
+    break_time <- which.max(model$Fstats)  
+    break_year <- remaining_years[break_time] 
+    
+    p_value <- sctest(model)$p.value
+    if (p_value <= significance_level) {
+      breaks[[i]] <- list(year = break_year, p_value = p_value)  # Store significant break
+    } else {
+      remaining_data <- remaining_data[(break_time + 1):n]
+      remaining_years <- remaining_years[(break_time + 1):n]
+      next
+    }
+    
+    remaining_data <- remaining_data[(break_time + 1):n]
+    remaining_years <- remaining_years[(break_time + 1):n]
+  }
+  
+  return(breaks)
+}
+
+results <- lapply(seq_along(data), function(i) {
+  perform_significant_qlr(data[[i]], years, max_breaks = 2, significance_level = 0.05)
+})
+
+output <- data.frame(
+  District = names(data),
+  break_year = sapply(results, function(x) {
+    if (length(x) > 0) {
+      paste(sapply(x, `[[`, "year"), collapse = ", ")
+    } else {
+      2010
+    }
+  }),
+  p_value = sapply(results, function(x) {
+    if (length(x) > 0) {
+      paste(sapply(x, `[[`, "p_value"), collapse = ", ")
+    } else {
+      1
+    }
+  }),
+  stringsAsFactors = FALSE
+)
+
+write.csv(output, "qlr_breaks.csv", row.names = FALSE)
+
+```
+
+## DiD Runs
+### Load the data 
+```{r}
+full_data <- read_dta("clean_parliament_data.dta")
+main_sub <- full_data[c("District", "year", "turnout_vage", "high_conflict_gov")]
+
+did_data <- read.csv("did_data.csv")
+did_data$post <- as.integer(did_data$year >= did_data$treat_year)
+did_data$treat_year <- ifelse(did_data$treat_year != 2010, did_data$treat_year, 2025)
+did_data$interaction <- did_data$post * did_data$treated
+did_data$high_conflict_casualty <- full_data$hi
+
+```
+
+### Parallel Trends plot 
+```{r}
+data_voter <- did_data[c("District", "year", "turnout_vage", "high_conflict_gov")]
+high_district <- unique(data_voter$District[data_voter$high_conflict_gov==1])
+data_voter$all_high <- as.numeric(data_voter$District  %in% high_district)
+test_agg_high <- aggregate(turnout_vage~year+all_high, data=data_voter, 
+                           mean, na.action = NULL, na.rm=FALSE)
+test_agg_high$intensity <- "high"
+test_agg_high$intensity[test_agg_high$all_high == 0] <- "low"
+test_agg_high$turnout_rate <- test_agg_high$turnout_vage / 100
+
+line_plot <- ggplot(data=test_agg_high, aes(x=year, y=turnout_rate, group=intensity)) +
+  geom_line(aes(color=intensity)) +
+  geom_point() +
+  labs(y="Voter Turnout Rate", x="Year") +
+  guides(color = guide_legend(title = "Conflict Intensity")) +
+  scale_x_continuous(breaks = seq(1990, 2014, by = 2))
+
+ggsave("parallel_trend.pdf",line_plot, width=7, height=2.5)
+```
+
+
+### Canonical TWFE 
+$$Y_{i, t} = \omega + \delta D_{i, t} + \alpha_i +  \gamma_t + \epsilon_{i, t}$$
+```{r}
+model1 <- lm(turnout_rate ~ interaction + factor(year) + factor(District), data=did_data) 
+summary(model1)
+```
+
+## Canonical DiD with Covariates 
+$$Y_{i, t} = \omega + \delta D_{i, t} + \beta X_{i, t} + \alpha_i +  \gamma_t + \epsilon_{i, t}$$
+```{r}
+literacy_data <- read.csv("literacy_pooled_data.csv", check.names = FALSE)
+#literacy_panel <- panel_data(literacy_data, id=District, wave=)
+did_data_covar <- merge(did_data, literacy_data, by=c("year", "District"))
+did_data_covar$literacy_rate <- did_data_covar$literacy_rate / 100
+model1 <- lm(turnout_rate ~ interaction + literacy_rate + factor(year) + factor(District), 
+             data=did_data_covar) 
+summary(model1)
+```
+## Callaway and Sant'Anna model 
+```{r}
+did_data$district_id <- as.numeric(factor(did_data$District))
+results <- att_gt(yname = "turnout_rate", tname="year", idname="district_id", 
+                  gname="treat_year", data=did_data)
+agg_result <- aggte(results, type = "dynamic", min_e = -15, max_e = 15)
+
+fig <- ggdid(agg_result)
+fig <- fig +
+  labs( 
+    x = "time (years)",                     # Label for the x-axis
+    y = "ATT-estimate"                      # Label for the y-axis
+  )
+ggsave(filename = "ggdid_plot.pdf", plot = fig, 
+       width = 6, height = 4, dpi = 300)
+print("Aggregate")
+aggte(results, type = "simple")
+```
+
+### Summary of the results
+```{r}
+agg_result
+```
+
+
+## Using Goodman-Bacon decomposition 
+```{r}
+library(bacondecomp)
+
+data_bacon <- did_data %>% filter(!is.na(turnout_rate))
+names(data_bacon)[names(data_bacon) == "treated"] <- "high_conflict"
+district_year_counts <- data_bacon %>%
+  group_by(district_id) %>%
+  summarise(n_years = n_distinct(year))
+
+# Identify states with complete years (assuming a range of years, e.g., 2000-2010)
+complete_districts <- district_year_counts %>%
+  filter(n_years == length(unique(data_bacon$year))) %>%
+  pull(district_id)
+
+# Filter data to keep only these complete states
+data_bacon_balanced <- data_bacon %>%
+  filter(district_id %in% complete_districts)
+
+
+bgd <- bacon(turnout_rate ~ interaction,
+  data = data_bacon_balanced %>% mutate(treat_year = ifelse(treat_year==2025, NA, treat_year)),
+  id_var = "district_id",
+  time_var = "year"
+)
+bgd_wm = weighted.mean(bgd$estimate, bgd$weight)
+
+ggplot(bgd, aes(x = weight, y = estimate, shape = type, col = type)) +
+  geom_hline(yintercept = bgd_wm, lty  = 2) +
+  geom_point(size = 3) +
+  labs(
+    x = "Weight", y = "Estimate", shape = "Type", col = "Type",
+    title = "Bacon-Goodman decomposition example",
+    caption = "Note: The horizontal dotted line depicts the full TWFE estimate."
+    )
+```
